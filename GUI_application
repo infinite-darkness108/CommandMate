@@ -1,0 +1,411 @@
+import tkinter
+import tkinter.messagebox
+import customtkinter
+import joblib
+import librosa
+from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import numpy as np
+import speech_recognition as Sr
+import os
+import webbrowser
+import wave
+from dataclasses import dataclass, asdict
+import pyaudio
+from pydub import AudioSegment
+from pydub.silence import split_on_silence
+from textblob import TextBlob
+
+
+customtkinter.set_appearance_mode("System")  # Modes: "System" (standard), "Dark", "Light"
+customtkinter.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
+
+@dataclass
+class StreamParams:
+    format: int = pyaudio.paInt16
+    channels: int = 2
+    rate: int = 44100
+    frames_per_buffer: int = 1024
+    input: bool = True
+    output: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+class Recorder:
+    """Recorder uses the blocking I/O facility from pyaudio to record sound
+    from mic.
+
+    Attributes:
+        - stream_params: StreamParams object with values for pyaudio Stream
+            object
+    """
+    def __init__(self, stream_params: StreamParams) -> None:
+        self.stream_params = stream_params
+        self._pyaudio = None
+        self._stream = None
+        self._wav_file = None
+
+    def record(self, duration: int, save_path: str) -> None:
+        """Record sound from mic for a given amount of seconds.
+
+        :param duration: Number of seconds we want to record for
+        :param save_path: Where to store recording
+        """
+        print("Start recording...")
+        self._create_recording_resources(save_path)
+        self._write_wav_file_reading_from_stream(duration)
+        self._close_recording_resources()
+        print("Stop recording")
+
+    def _create_recording_resources(self, save_path: str) -> None:
+        self._pyaudio = pyaudio.PyAudio()
+        self._stream = self._pyaudio.open(**self.stream_params.to_dict())
+        self._create_wav_file(save_path)
+
+    def _create_wav_file(self, save_path: str):
+        self._wav_file = wave.open(save_path, "wb")
+        self._wav_file.setnchannels(self.stream_params.channels)
+        self._wav_file.setsampwidth(self._pyaudio.get_sample_size(self.stream_params.format))
+        self._wav_file.setframerate(self.stream_params.rate)
+
+    def _write_wav_file_reading_from_stream(self, duration: int) -> None:
+        for _ in range(int(self.stream_params.rate * duration / self.stream_params.frames_per_buffer)):
+            audio_data = self._stream.read(self.stream_params.frames_per_buffer)
+            self._wav_file.writeframes(audio_data)
+
+    def _close_recording_resources(self) -> None:
+        self._wav_file.close()
+        self._stream.close()
+        self._pyaudio.terminate()
+                
+
+class App(customtkinter.CTk):
+    def __init__(self):
+        super().__init__()
+
+        # configure window
+        self.title("CommandMate")
+        self.geometry(f"{1100}x{580}")
+
+        # configure grid layout (4x4)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure((2, 3), weight=1)
+        self.grid_rowconfigure((0, 1, 2), weight=1)
+
+        # create sidebar frame with widgets
+        self.sidebar_frame = customtkinter.CTkFrame(self, width=140, corner_radius=0)
+        self.sidebar_frame.grid(row=0, column=0, rowspan=4, sticky="nsew")
+        self.sidebar_frame.grid_rowconfigure(4, weight=1)
+        self.logo_label = customtkinter.CTkLabel(self.sidebar_frame, text="CommandMate", font=customtkinter.CTkFont(size=20, weight="bold"))
+        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+        self.sidebar_button_1 = customtkinter.CTkButton(self.sidebar_frame,text = 'voice command', command=self.sidebar_button_event)
+        self.sidebar_button_1.grid(row=1, column=0, padx=20, pady=10)
+        self.sidebar_button_2 = customtkinter.CTkButton(self.sidebar_frame,text = 'Diarization', command=self.diarize)
+        self.sidebar_button_2.grid(row=2, column=0, padx=20, pady=10)
+        self.sidebar_button_3 = customtkinter.CTkButton(self.sidebar_frame,text = 'History', command=self.open_input_dialog_event)
+        self.sidebar_button_3.grid(row=3, column=0, padx=20, pady=10)
+        self.sidebar_button_4 = customtkinter.CTkButton(self.sidebar_frame,text = 'Meta - Sentiment&Gender', command=self.meta)
+        self.sidebar_button_4.grid(row=4, column=0, padx=20, pady=10)
+
+        self.appearance_mode_label = customtkinter.CTkLabel(self.sidebar_frame, text="Appearance Mode:", anchor="w")
+        self.appearance_mode_label.grid(row=5, column=0, padx=20, pady=(10, 0))
+        self.appearance_mode_optionemenu = customtkinter.CTkOptionMenu(self.sidebar_frame, values=["Light", "Dark", "System"],
+                                                                       command=self.change_appearance_mode_event)
+        self.appearance_mode_optionemenu.grid(row=6, column=0, padx=20, pady=(10, 10))
+        self.scaling_label = customtkinter.CTkLabel(self.sidebar_frame, text="UI Scaling:", anchor="w")
+        self.scaling_label.grid(row=7, column=0, padx=20, pady=(10, 0))
+        self.scaling_optionemenu = customtkinter.CTkOptionMenu(self.sidebar_frame, values=["80%", "90%", "100%", "110%", "120%"],
+                                                               command=self.change_scaling_event)
+        self.scaling_optionemenu.grid(row=8, column=0, padx=20, pady=(10, 20))
+
+
+        # create textbox
+        self.textbox = customtkinter.CTkTextbox(self,width=700,height=500)
+        self.textbox.grid(row=0, column=1, padx=(20, 0), pady=(20, 0), sticky="nsew")
+
+        # set default values
+        self.textbox.insert("0.0", "CommandMate!\n\n"+'An application for speaker diarization using GMM model and customTkinter GUI! \n'+'Opens a specific application prompted by your voice command only if you are a registered user! \n'+'Can collect meta details like gender and sentiment from speech! \n\n')
+
+    def open_input_dialog_event(self):
+        with open(r'C:\Users\91892\Desktop\history.txt','r') as f:
+            lines = f.readlines()
+            for line in lines:
+                self.textbox.insert("10.0",line.rstrip())
+                self.textbox.insert("10.0",'\n')
+    def change_appearance_mode_event(self, new_appearance_mode: str):
+        customtkinter.set_appearance_mode(new_appearance_mode)
+
+    def change_scaling_event(self, new_scaling: str):
+        new_scaling_float = int(new_scaling.replace("%", "")) / 100
+        customtkinter.set_widget_scaling(new_scaling_float)
+
+    def sidebar_button_event(self):
+        
+        if __name__ == "__main__":
+            stream_params = StreamParams()
+            recorder = Recorder(stream_params)
+            recorder.record(5, "audio.wav")
+
+        file_path = r'C:\Users\91892\Desktop\audio.wav'
+        file_name = file_path.split('/')[-1]
+        audio_format = "wav"
+
+        # Reading and splitting the audio file into chunks
+        sound = AudioSegment.from_file(file_path, format = audio_format)
+        audio_chunks = split_on_silence(sound
+                                    ,min_silence_len = 100
+                                    ,silence_thresh = -45
+                                    ,keep_silence = 50
+                                )
+
+        # Putting the file back together
+        combined = AudioSegment.empty()
+        for chunk in audio_chunks:
+            combined += chunk
+        combined.export(r'C:\Users\91892\Desktop\audio.wav', format = audio_format)
+
+
+        r = Sr.Recognizer()
+        with Sr.AudioFile(r'C:\Users\91892\Desktop\audio.wav') as source:
+            audio = r.record(source)
+            text=r.recognize_google(audio,show_all=True)
+        
+        try:text=text['alternative'][0]['transcript']
+        except: pass
+        if text in ['h','HHH','ach','hh','h i','edge','veg','Zedge','age','wedge','admj','Aaj']:
+            text = 'edge'
+
+        elif text in ['Paithan','Mithun','item','python','mitron','pattern','chitin','Titan']:
+            text = 'python'
+
+        elif text in ['arduino','how do you know','aur do you know','what do you know','all do you know','how DU U no','what do you no']:
+            text = 'arduino'
+
+        elif text in ['lms','Gil MBS','Yellamma','Gal m','yellow moss','yellow mass','yellowmist','LMS','elemis','L M S','LLM','LM','l l m','l m']:
+            text = 'lms'
+
+        elif text in ['gpt','GPT','g p t','GP t','zpt','GTT']:
+            text = 'gpt'
+
+        elif text in ['colab','Gulab','cooler','Kolam','core lab','collab','ko lab','ko lab','Kalyan','Khula','Gulam']:
+            text = 'colab'
+
+        elif text in ['flickering','licking','Lakadi','recording','lingering','linkedin','LinkedIn','linking','blinking','lingding']:
+            text = 'linkedin'
+
+        elif text in ['gmail','G mail','G Mail','Gmail','email','digimail','Bimal']:
+            text = 'gmail'
+
+        elif text in ['slide','lied','slayed','slight']:
+            text = slide
+
+            
+        gmm_speaker1 = joblib.load(r'C:\Users\91892\Downloads\Amma (2).pkl')
+        gmm_speaker2 = joblib.load(r'C:\Users\91892\Downloads\Lakshmi (2).pkl')
+        gmm_speaker3 = joblib.load(r'C:\Users\91892\Downloads\Krishna (2).pkl')
+
+        y,sr = librosa.load(r'C:\Users\91892\Desktop\audio.wav')
+        y, _ = librosa.effects.trim(y)
+        df = pd.DataFrame()
+        mfc = librosa.feature.mfcc(y=y,sr=sr,n_mfcc=20,n_fft=512,hop_length=256)
+        df = pd.concat([df, pd.DataFrame(np.ndarray.tolist(mfc.T))], ignore_index=True)
+
+        df_filtered = df[(df != 0).all(1)]
+        z = StandardScaler()
+        Z = z.fit_transform(df_filtered)
+        Z = pd.DataFrame(Z)
+
+        condition = False
+        s=0;l=0;k=0
+        for i in range(len(Z)):
+            score_speaker1 = gmm_speaker1.score(Z.values[i].reshape(1, -1))
+            score_speaker2 = gmm_speaker2.score(Z.values[i].reshape(1, -1))
+            score_speaker3 = gmm_speaker3.score(Z.values[i].reshape(1, -1))
+            if score_speaker1 > score_speaker2 and score_speaker1 > score_speaker3: s+=1
+            elif score_speaker3 > score_speaker2 and score_speaker3 > score_speaker1: k+=1
+            else: l+=1
+
+        if s>l and s>k:
+            self.textbox.insert("10.0",'Sumathi: '+text + "\n\n")
+            with open (r'C:\Users\91892\Desktop\history.txt','a') as f:
+                f.write('Sumathi: '+text + "\n\n")
+                
+        elif k>s and k>l:
+            self.textbox.insert("10.0",'Krishna: '+text + "\n\n")
+            condition=True;
+            with open (r'C:\Users\91892\Desktop\history.txt','a') as f:
+                f.write('Krishna: '+text + "\n\n")
+                
+        else:
+            self.textbox.insert("10.0", 'Lakshmi: '+text + "\n\n")
+            with open (r'C:\Users\91892\Desktop\history.txt','a') as f:
+                f.write('Lakshmi: '+text + "\n\n")
+
+
+
+        if (condition):
+            
+            if text == 'edge':
+                folder_path = r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
+                os.startfile(folder_path)
+                
+            if text == 'python':
+                folder_path = r'C:\Users\91892\AppData\Local\Programs\Python\Python311\Lib\idlelib\idle.pyw'
+                os.startfile(folder_path)
+           
+            if text == 'arduino':
+                folder_path = r'C:\Users\91892\AppData\Local\Programs\Arduino IDE\Arduino IDE.exe'
+                os.startfile(folder_path)
+            
+            if text == 'lms':
+                opens = webbrowser.open('https://lms.ssn.edu.in/course/view.php?id=646')
+
+            if text == 'gpt':
+                opens = webbrowser.open('https://chat.openai.com/')
+
+            if text == 'colab':
+                opens = webbrowser.open('https://drive.google.com/drive/folders/1c2RAp9b4cieROF29t2Ddnaj9ijz5RjK1')
+
+            if text == 'linkedin':
+                opens = webbrowser.open('https://www.linkedin.com/feed/')
+
+            if text == 'gmail':
+                opens = webbrowser.open('https://mail.google.com/mail/u/0/#inbox')
+
+            if text == 'slide':
+                opens = webbrowser.open('https://docs.google.com/presentation/u/0/?tgif=d')
+            
+    def diarize(self):
+        self.textbox.insert("10.0",'--------Diarization----------'+ "\n\n")
+        while True:
+            try:
+                stream_params = StreamParams()
+                recorder = Recorder(stream_params)
+                
+                recorder.record(5, "audio.wav")
+                
+                file_path = r'C:\Users\91892\Desktop\audio.wav'
+                file_name = file_path.split('/')[-1]
+                audio_format = "wav"
+
+                # Reading and splitting the audio file into chunks
+                sound = AudioSegment.from_file(file_path, format = audio_format)
+                audio_chunks = split_on_silence(sound
+                                            ,min_silence_len = 100
+                                            ,silence_thresh = -45
+                                            ,keep_silence = 50
+                                        )
+
+                # Putting the file back together
+                combined = AudioSegment.empty()
+                for chunk in audio_chunks:
+                    combined += chunk
+                combined.export(r'C:\Users\91892\Desktop\audio.wav', format = audio_format)
+
+
+                r = Sr.Recognizer()
+                with Sr.AudioFile(r'C:\Users\91892\Desktop\audio.wav') as source:
+                    audio = r.record(source)
+                    text=r.recognize_google(audio,show_all=True)
+
+                try:text=text['alternative'][0]['transcript']
+                except: pass
+
+                gmm_speaker1 = joblib.load(r'C:\Users\91892\Downloads\Amma (2).pkl')
+                gmm_speaker2 = joblib.load(r'C:\Users\91892\Downloads\Lakshmi (2).pkl')
+                gmm_speaker3 = joblib.load(r'C:\Users\91892\Downloads\Krishna (2).pkl')
+
+                y,sr = librosa.load(r'C:\Users\91892\Desktop\audio.wav')
+                y, _ = librosa.effects.trim(y)
+                df = pd.DataFrame()
+                mfc = librosa.feature.mfcc(y=y,sr=sr,n_mfcc=20,n_fft=512,hop_length=256)
+                df = pd.concat([df, pd.DataFrame(np.ndarray.tolist(mfc.T))], ignore_index=True)
+
+                df_filtered = df[(df != 0).all(1)]
+                z = StandardScaler()
+                Z = z.fit_transform(df_filtered)
+                Z = pd.DataFrame(Z)
+
+                condition = False
+                s=0;l=0;k=0
+                for i in range(len(Z)):
+                    score_speaker1 = gmm_speaker1.score(Z.values[i].reshape(1, -1))
+                    score_speaker2 = gmm_speaker2.score(Z.values[i].reshape(1, -1))
+                    score_speaker3 = gmm_speaker3.score(Z.values[i].reshape(1, -1))
+                    if score_speaker1 > score_speaker2 and score_speaker1 > score_speaker3: s+=1
+                    elif score_speaker3 > score_speaker2 and score_speaker3 > score_speaker1: k+=1
+                    else: l+=1
+                
+                if s>l and s>k: self.textbox.insert("10.0",'Sumathi: '+text + "\n\n")       
+                elif k>s and k>l: self.textbox.insert("10.0",'Krishna: '+text + "\n\n")    
+                else: self.textbox.insert("10.0",'Lakshmi: '+text + "\n\n")           
+                
+                
+            except KeyboardInterrupt:
+                break
+
+    def meta(self):
+        stream_params = StreamParams()
+        recorder = Recorder(stream_params)
+        
+        recorder.record(5, "audio.wav")
+        
+        file_path = r'C:\Users\91892\Desktop\audio.wav'
+        file_name = file_path.split('/')[-1]
+        audio_format = "wav"
+
+        # Reading and splitting the audio file into chunks
+        sound = AudioSegment.from_file(file_path, format = audio_format)
+        audio_chunks = split_on_silence(sound
+                                    ,min_silence_len = 100
+                                    ,silence_thresh = -45
+                                    ,keep_silence = 50
+                                )
+
+        # Putting the file back together
+        combined = AudioSegment.empty()
+        for chunk in audio_chunks:
+            combined += chunk
+        combined.export(r'C:\Users\91892\Desktop\audio.wav', format = audio_format)
+
+
+
+        gmm_speaker1 = joblib.load(r'C:\Users\91892\Downloads\male.pkl')
+        gmm_speaker2 = joblib.load(r'C:\Users\91892\Downloads\female.pkl')
+        y,sr = librosa.load(r'C:\Users\91892\Desktop\audio.wav')
+        y, _ = librosa.effects.trim(y)
+        df = pd.DataFrame()
+        mfc = librosa.feature.mfcc(y=y,sr=sr,n_mfcc=20,n_fft=512,hop_length=256)
+        df = pd.concat([df, pd.DataFrame(np.ndarray.tolist(mfc.T))], ignore_index=True)
+
+        df_filtered = df[(df != 0).all(1)]
+        z = StandardScaler()
+        Z = z.fit_transform(df_filtered)
+        Z = pd.DataFrame(Z)
+
+        condition = False
+        m = 0; f = 0
+        for i in range(len(Z)):
+            score_speaker1 = gmm_speaker1.score(Z.values[i].reshape(1, -1))
+            score_speaker2 = gmm_speaker2.score(Z.values[i].reshape(1, -1))
+            if score_speaker1 > score_speaker2: m+=1
+            else: f+=1
+        
+        if m>f : self.textbox.insert("10.0",'Detected: Male' + "\n\n")           
+        else: self.textbox.insert("10.0",'Detected: Female'+ "\n\n")                   
+        
+        r = Sr.Recognizer()
+        with Sr.AudioFile(r'C:\Users\91892\Desktop\audio.wav') as source:
+            audio = r.record(source)
+            text=r.recognize_google(audio,show_all=True)
+
+        try:text=text['alternative'][0]['transcript']
+        except: pass
+
+        blob = TextBlob(text)
+        if blob.sentiment.polarity>0: self.textbox.insert("10.0",'Positive sentiment'+ "\n\n")
+        else: self.textbox.insert("10.0",'Negative sentiment'+ "\n\n")
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
